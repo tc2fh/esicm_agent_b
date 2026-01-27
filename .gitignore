@@ -1,0 +1,15 @@
+# pixi environments
+.pixi/*
+!.pixi/config.toml
+
+# cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+#data files
+*.csv
+*.parquet
+
+#model files
+*.pkl
