@@ -10,10 +10,10 @@ import random
 
 # --- 1. CONFIGURATION ---
 # Base features (vitals from PROMIZING Protocol)
-BASE_FEATURES = ['peep_mean', 'peak_mean', 'sbp_mean']
+BASE_FEATURES = ['peep_mean', 'peak_mean', 'sbp_mean', 'fio2_mean']
 
 # Trend features will be added dynamically
-TREND_SOURCE_FEATURES = ['peep_mean', 'peak_mean', 'sbp_mean']
+TREND_SOURCE_FEATURES = ['peep_mean', 'peak_mean', 'sbp_mean', 'fio2_mean']
 
 def get_all_feature_names():
     """Returns the full list of features including trends."""
@@ -23,20 +23,21 @@ def get_all_feature_names():
         features.append(f"{feat}_slope4h")
     return features
 
-FEATURES = get_all_feature_names()  # Will be: base + 6 trend features = 9 features
+FEATURES = get_all_feature_names()  # Will be: base + 8 trend features = 12 features
 
 # Indices for the "Driver" features (base features only)
 IDX_PEEP = 0
 IDX_PEAK = 1
 IDX_SBP  = 2
+IDX_FIO2 = 3
 
 def load_and_preprocess(filepath):
     """
-    Load data, impute missing values.
+    Load data, impute missing values, and handle FiO2 scaling/conversion
     """
     print(f"Loading data from {filepath}...")
     try:
-        df = pd.read_csv(filepath)
+        df = pd.read_parquet(filepath)
     except FileNotFoundError:
         print(f"Error: File {filepath} not found.")
         sys.exit(1)
@@ -107,8 +108,7 @@ def prepare_hmm_sequences(df, X_scaled):
 
 def forward_algorithm(model, X):
     """
-    Compute true filtered posterior P(S_t | x_0:t) using the forward algorithm.
-    This is the "online" inference used for bedside monitoring.
+    Compute true filtered posterior P(S_t | x_0:t)
     
     Returns:
         filtered_probs: (T, n_components) array of P(S_t | x_0:t)
@@ -119,29 +119,32 @@ def forward_algorithm(model, X):
     log_startprob = np.log(model.startprob_ + 1e-10)
     log_transmat = np.log(model.transmat_ + 1e-10)
     
-    # Compute log emission probabilities P(x_t | S_t = k)
-    log_emit = np.zeros((n_samples, n_components))
+    # # Compute log emission probabilities P(x_t | S_t = k)
+    # log_emit = np.zeros((n_samples, n_components))
     
-    # Handle different covariance types
-    for k in range(n_components):
-        try:
-            if model.covariance_type == 'diag':
-                # Diagonal covariance -> convert to full for multivariate_normal
-                cov = np.diag(model.covars_[k])
-            elif model.covariance_type == 'full':
-                cov = model.covars_[k]
-            else:
-                cov = model.covars_[k]
+    # # Handle different covariance types
+    # for k in range(n_components):
+    #     try:
+    #         if model.covariance_type == 'diag':
+    #             # Diagonal covariance -> convert to full for multivariate_normal
+    #             cov = np.diag(model.covars_[k])
+    #         elif model.covariance_type == 'full':
+    #             cov = model.covars_[k]
+    #         else:
+    #             cov = model.covars_[k]
             
-            mvn = multivariate_normal(
-                mean=model.means_[k],
-                cov=cov,
-                allow_singular=True
-            )
-            log_emit[:, k] = mvn.logpdf(X)
-        except Exception:
-            log_emit[:, k] = -100  # Very low probability on failure
+    #         mvn = multivariate_normal(
+    #             mean=model.means_[k],
+    #             cov=cov,
+    #             allow_singular=True
+    #         )
+    #         log_emit[:, k] = mvn.logpdf(X)
+    #     except Exception:
+    #         log_emit[:, k] = -100  # Very low probability on failure
     
+    # Precompute log emission probabilities
+    log_emit = model._compute_log_likelihood(X)
+
     # Forward pass in log space
     log_alpha = np.zeros((n_samples, n_components))
     
@@ -149,10 +152,9 @@ def forward_algorithm(model, X):
     log_alpha[0] = log_startprob + log_emit[0]
     
     for t in range(1, n_samples):
-        for j in range(n_components):
-            log_alpha[t, j] = log_emit[t, j] + np.logaddexp.reduce(
-                log_alpha[t-1] + log_transmat[:, j]
-            )
+        log_alpha[t] = log_emit[t] + np.logaddexp.reduce(
+            log_alpha[t-1, :, np.newaxis] + log_transmat, axis=0
+        )
     
     # Normalize to get filtered probabilities
     log_normalizer = np.logaddexp.reduce(log_alpha, axis=1, keepdims=True)
@@ -163,60 +165,86 @@ def forward_algorithm(model, X):
 
 def initialize_hmm_with_clinical_thresholds(scaler, n_features, n_components=4):
     """
-    Initialize HMM Means using PROMIZING Protocol thresholds.
-    Only base features (peep, peak, sbp) get clinical initialization.
-    Trend features are initialized at 0.
+    States:
+    0: Acute
+    1: Recovery
+    2: Weaning (Ready for SBT: PEEP<=8, FiO2<=40%)
+    3: Liberation
     """
     print("Initializing HMM using PROMIZING Protocol cutoffs...")
     
-    model = GaussianHMM(n_components=n_components, covariance_type="diag", n_iter=100, 
-                        init_params="c", verbose=True, random_state=42)
+    model = GaussianHMM(n_components=n_components, covariance_type="full", n_iter=50, 
+                        init_params="c", verbose=False, random_state=42)
     
-    # Scaler was fit on ALL features, so we need to get stats for indices 0-2 (base features)
+    # Scaler was fit on ALL features, so we need to get stats for base features
     mus = scaler.mean_
     sigmas = scaler.scale_
     
     def get_z(feature_idx, raw_value):
         return (raw_value - mus[feature_idx]) / sigmas[feature_idx]
 
-    # Clinical thresholds (PROMIZING Protocol)
-    PEEP_ACUTE, PEAK_ACUTE, SBP_ACUTE = 18.0, 35.0, 85.0
-    PEEP_REC, PEAK_REC, SBP_REC = 12.0, 25.0, 115.0
-    PEEP_WEAN, PEAK_WEAN, SBP_WEAN = 6.0, 18.0, 120.0
-    PEEP_LIB, PEAK_LIB, SBP_LIB = 5.0, 10.0, 120.0
-
+    # --- CLINICAL CENTROIDS (Raw Values) ---
+    # Based on PROMIZING / Standard Weaning Phases
+    # FiO2 is in % (0-100)
+    
+    # State 0: ACUTE (Instability)
+    # High PEEP, High FiO2, High Peak, Variable BP (often hypotensive or pressor dependent)
+    C_ACUTE = {
+        IDX_PEEP: 14.0,  # >10
+        IDX_PEAK: 35.0,  # >30
+        IDX_SBP:  100.0, # Hypotensive risk or controlled
+        IDX_FIO2: 60.0   # >50%
+    }
+    
+    # State 1: RECOVERY (Stabilization)
+    # Better but not ready to wean.
+    C_REC = {
+        IDX_PEEP: 10.0,  # 8-10
+        IDX_PEAK: 28.0,
+        IDX_SBP:  115.0,
+        IDX_FIO2: 50.0   # 40-50%
+    }
+    
+    # State 2: WEANING (Weaning Criteria Met)
+    # PEEP <= 8, FiO2 <= 40% (0.4)
+    C_WEAN = {
+        IDX_PEEP: 7.0,   # <=8
+        IDX_PEAK: 22.0,
+        IDX_SBP:  120.0,
+        IDX_FIO2: 35.0   # <=40%
+    }
+    
+    # State 3: LIBERATION (Minimal / Extubation Ready)
+    # Lowest settings
+    C_LIB = {
+        IDX_PEEP: 5.0,   # 5
+        IDX_PEAK: 16.0,
+        IDX_SBP:  125.0,
+        IDX_FIO2: 25.0   # ~21-30%
+    }
+    
     means_init = np.zeros((n_components, n_features))
     
-    # Initialize base features only; trend features stay at 0 (no trend = mean)
-    means_init[0, IDX_PEEP] = get_z(IDX_PEEP, PEEP_ACUTE) 
-    means_init[0, IDX_PEAK] = get_z(IDX_PEAK, PEAK_ACUTE)
-    means_init[0, IDX_SBP]  = get_z(IDX_SBP, SBP_ACUTE)
-    
-    means_init[1, IDX_PEEP] = get_z(IDX_PEEP, PEEP_REC)
-    means_init[1, IDX_PEAK] = get_z(IDX_PEAK, PEAK_REC)
-    means_init[1, IDX_SBP]  = get_z(IDX_SBP, SBP_REC)
-    
-    means_init[2, IDX_PEEP] = get_z(IDX_PEEP, PEEP_WEAN)
-    means_init[2, IDX_PEAK] = get_z(IDX_PEAK, PEAK_WEAN)
-    means_init[2, IDX_SBP]  = get_z(IDX_SBP, SBP_WEAN)
-    
-    means_init[3, IDX_PEEP] = get_z(IDX_PEEP, PEEP_LIB)
-    means_init[3, IDX_PEAK] = get_z(IDX_PEAK, PEAK_LIB)
-    means_init[3, IDX_SBP]  = get_z(IDX_SBP, SBP_LIB)
-
+   # Fill base feature means
+    for idx, feature_idx in enumerate([IDX_PEEP, IDX_PEAK, IDX_SBP, IDX_FIO2]):
+        means_init[0, feature_idx] = get_z(feature_idx, C_ACUTE[feature_idx])
+        means_init[1, feature_idx] = get_z(feature_idx, C_REC[feature_idx])
+        means_init[2, feature_idx] = get_z(feature_idx, C_WEAN[feature_idx])
+        means_init[3, feature_idx] = get_z(feature_idx, C_LIB[feature_idx])
+        
     model.means_ = means_init
     
-    # Transition Matrix
+    # Transition Matrix (Left-to-right dominance with relapse allowed)
     trans_init = np.array([
-        [0.85, 0.10, 0.05, 0.00],
-        [0.10, 0.80, 0.10, 0.00],
-        [0.05, 0.05, 0.80, 0.10],
-        [0.01, 0.01, 0.05, 0.93],
+        [0.80, 0.15, 0.05, 0.00], # Acute -> Acute/Rec
+        [0.10, 0.75, 0.15, 0.00], # Rec -> Rec/Wean (some relapse to Acute)
+        [0.05, 0.10, 0.75, 0.10], # Wean -> Wean/Lib (some relapse)
+        [0.01, 0.01, 0.05, 0.93], # Lib -> Lib (Stable)
     ])
     trans_init = trans_init / trans_init.sum(axis=1, keepdims=True)
     model.transmat_ = trans_init
     
-    model.startprob_ = np.array([0.5, 0.4, 0.1, 0.0])
+    model.startprob_ = np.array([0.6, 0.3, 0.1, 0.0]) # Start mostly in Acute
     
     return model
 
@@ -297,7 +325,8 @@ def visualize_patient_trajectory(model, patient_data, X_patient, state_map, file
 
 
 def main():
-    data_path = "clinical_data/data_v1_max_72_h.csv"
+    print('main function started...')
+    data_path = "clinical_data/data_v2_max_72_h.parquet" # must be parquet file
     
     # 1. Load and Preprocess
     df = load_and_preprocess(data_path)
@@ -330,6 +359,9 @@ def main():
     X_train, lengths_train = prepare_hmm_sequences(df_train, df_train[FEATURES].values)
     X_test, lengths_test = prepare_hmm_sequences(df_test, df_test[FEATURES].values)
     
+    X_train = np.asarray(X_train, dtype=np.float64, order="C")
+    X_test  = np.asarray(X_test, dtype=np.float64, order="C")
+
     # 5. Architecture & Init
     n_features = len(FEATURES)
     model = initialize_hmm_with_clinical_thresholds(scaler, n_features)

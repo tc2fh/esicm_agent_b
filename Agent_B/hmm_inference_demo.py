@@ -7,8 +7,8 @@ import os
 from scipy.stats import multivariate_normal
 
 # --- Feature Configuration (must match hmm_prototype.py) ---
-BASE_FEATURES = ['peep_mean', 'peak_mean', 'sbp_mean']
-TREND_SOURCE_FEATURES = ['peep_mean', 'peak_mean', 'sbp_mean']
+BASE_FEATURES = ['peep_mean', 'peak_mean', 'sbp_mean', 'fio2_mean']
+TREND_SOURCE_FEATURES = ['peep_mean', 'peak_mean', 'sbp_mean', 'fio2_mean']
 
 def get_all_feature_names():
     """Returns the full list of features including trends."""
