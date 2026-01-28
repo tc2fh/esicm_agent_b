@@ -38,6 +38,7 @@ def load_and_preprocess(filepath):
     print(f"Loading data from {filepath}...")
     try:
         df = pd.read_parquet(filepath)
+        df = df.reset_index()
     except FileNotFoundError:
         print(f"Error: File {filepath} not found.")
         sys.exit(1)
@@ -66,7 +67,29 @@ def load_and_preprocess(filepath):
     # Drop rows that are still NaN
     df_subset.dropna(subset=BASE_FEATURES, inplace=True)
     
+    # ADD: Clip physiologically impossible values
+    print("Clipping outliers...")
+    PHYSIOLOGICAL_BOUNDS = {
+        'peep_mean': (0, 25),      # PEEP: 0-25 cmH2O
+        'peak_mean': (5, 60),      # Peak pressure: 5-60 cmH2O
+        'sbp_mean': (40, 250),     # SBP: 40-250 mmHg
+        'fio2_mean': (21, 100),    # FiO2: 21-100%
+    }
+    
+    for col, (low, high) in PHYSIOLOGICAL_BOUNDS.items():
+        if col in df_subset.columns:
+            n_clipped = ((df_subset[col] < low) | (df_subset[col] > high)).sum()
+            df_subset[col] = df_subset[col].clip(low, high)
+            if n_clipped > 0:
+                print(f"  {col}: clipped {n_clipped} values to [{low}, {high}]")
+    
+    print("\nData quality check:")
+    for col in BASE_FEATURES:
+        print(f"{col}: min={df_subset[col].min():.1f}, max={df_subset[col].max():.1f}, "
+              f"mean={df_subset[col].mean():.1f}, NaN={df_subset[col].isna().sum()}")
+
     return df_subset
+
 
 
 def make_trend_features(df):
@@ -119,29 +142,6 @@ def forward_algorithm(model, X):
     log_startprob = np.log(model.startprob_ + 1e-10)
     log_transmat = np.log(model.transmat_ + 1e-10)
     
-    # # Compute log emission probabilities P(x_t | S_t = k)
-    # log_emit = np.zeros((n_samples, n_components))
-    
-    # # Handle different covariance types
-    # for k in range(n_components):
-    #     try:
-    #         if model.covariance_type == 'diag':
-    #             # Diagonal covariance -> convert to full for multivariate_normal
-    #             cov = np.diag(model.covars_[k])
-    #         elif model.covariance_type == 'full':
-    #             cov = model.covars_[k]
-    #         else:
-    #             cov = model.covars_[k]
-            
-    #         mvn = multivariate_normal(
-    #             mean=model.means_[k],
-    #             cov=cov,
-    #             allow_singular=True
-    #         )
-    #         log_emit[:, k] = mvn.logpdf(X)
-    #     except Exception:
-    #         log_emit[:, k] = -100  # Very low probability on failure
-    
     # Precompute log emission probabilities
     log_emit = model._compute_log_likelihood(X)
 
@@ -173,8 +173,8 @@ def initialize_hmm_with_clinical_thresholds(scaler, n_features, n_components=4):
     """
     print("Initializing HMM using PROMIZING Protocol cutoffs...")
     
-    model = GaussianHMM(n_components=n_components, covariance_type="full", n_iter=50, 
-                        init_params="c", verbose=False, random_state=42)
+    model = GaussianHMM(n_components=n_components, covariance_type="diag", n_iter=100, 
+                        init_params="", params='st', verbose=False, random_state=42)
     
     # Scaler was fit on ALL features, so we need to get stats for base features
     mus = scaler.mean_
@@ -190,37 +190,37 @@ def initialize_hmm_with_clinical_thresholds(scaler, n_features, n_components=4):
     # State 0: ACUTE (Instability)
     # High PEEP, High FiO2, High Peak, Variable BP (often hypotensive or pressor dependent)
     C_ACUTE = {
-        IDX_PEEP: 14.0,  # >10
+        IDX_PEEP: 12.0,  # >10
         IDX_PEAK: 35.0,  # >30
-        IDX_SBP:  100.0, # Hypotensive risk or controlled
-        IDX_FIO2: 60.0   # >50%
+        IDX_SBP:  95.0, # Hypotensive risk or controlled
+        IDX_FIO2: 75.0   # >50%
     }
     
     # State 1: RECOVERY (Stabilization)
     # Better but not ready to wean.
     C_REC = {
-        IDX_PEEP: 10.0,  # 8-10
-        IDX_PEAK: 28.0,
+        IDX_PEEP: 8.0,  # 8-10
+        IDX_PEAK: 26.0,
         IDX_SBP:  115.0,
-        IDX_FIO2: 50.0   # 40-50%
+        IDX_FIO2: 55.0   # 40-50%
     }
     
     # State 2: WEANING (Weaning Criteria Met)
     # PEEP <= 8, FiO2 <= 40% (0.4)
     C_WEAN = {
-        IDX_PEEP: 7.0,   # <=8
+        IDX_PEEP: 6.0,   # <=8
         IDX_PEAK: 22.0,
-        IDX_SBP:  120.0,
-        IDX_FIO2: 35.0   # <=40%
+        IDX_SBP:  125.0,
+        IDX_FIO2: 40.0   # <=40%
     }
     
     # State 3: LIBERATION (Minimal / Extubation Ready)
     # Lowest settings
     C_LIB = {
         IDX_PEEP: 5.0,   # 5
-        IDX_PEAK: 16.0,
+        IDX_PEAK: 18.0,
         IDX_SBP:  125.0,
-        IDX_FIO2: 25.0   # ~21-30%
+        IDX_FIO2: 28.0   # ~21-30%
     }
     
     means_init = np.zeros((n_components, n_features))
@@ -233,18 +233,26 @@ def initialize_hmm_with_clinical_thresholds(scaler, n_features, n_components=4):
         means_init[3, feature_idx] = get_z(feature_idx, C_LIB[feature_idx])
         
     model.means_ = means_init
+
+    # Use 1.0 for base features (1 std dev spread), larger for trends
+    covars_init = np.ones((n_components, n_features))
+    # Base features: moderate spread
+    covars_init[:, :4] = 1.0
+    # Trend features: allow more variance (trends are noisy)
+    covars_init[:, 4:] = 2.0
+    model.covars_ = covars_init
     
     # Transition Matrix (Left-to-right dominance with relapse allowed)
     trans_init = np.array([
-        [0.80, 0.15, 0.05, 0.00], # Acute -> Acute/Rec
-        [0.10, 0.75, 0.15, 0.00], # Rec -> Rec/Wean (some relapse to Acute)
-        [0.05, 0.10, 0.75, 0.10], # Wean -> Wean/Lib (some relapse)
-        [0.01, 0.01, 0.05, 0.93], # Lib -> Lib (Stable)
+        [0.85, 0.10, 0.05, 0.00],
+        [0.05, 0.80, 0.15, 0.00],
+        [0.02, 0.08, 0.80, 0.10],
+        [0.01, 0.02, 0.07, 0.90],
     ])
     trans_init = trans_init / trans_init.sum(axis=1, keepdims=True)
     model.transmat_ = trans_init
     
-    model.startprob_ = np.array([0.6, 0.3, 0.1, 0.0]) # Start mostly in Acute
+    model.startprob_ = np.array([0.2, 0.4, 0.3, 0.1])
     
     return model
 
@@ -362,6 +370,13 @@ def main():
     X_train = np.asarray(X_train, dtype=np.float64, order="C")
     X_test  = np.asarray(X_test, dtype=np.float64, order="C")
 
+    # DEBUG: Check data distribution vs clinical centroids
+    print("\nData distribution (raw, before scaling):")
+    raw_train = scaler.inverse_transform(df_train[FEATURES].values)
+    for i, feat in enumerate(FEATURES[:4]):
+        print(f"  {feat}: mean={raw_train[:, i].mean():.1f}, std={raw_train[:, i].std():.1f}, "
+                f"min={raw_train[:, i].min():.1f}, max={raw_train[:, i].max():.1f}")
+
     # 5. Architecture & Init
     n_features = len(FEATURES)
     model = initialize_hmm_with_clinical_thresholds(scaler, n_features)
@@ -386,20 +401,53 @@ def main():
     log_likelihood = model.score(X_test, lengths_test)
     print(f"\nTest Set Log-Likelihood: {log_likelihood:.4f}")
     
-    print("\nDecoding test set states (using Viterbi)...")
-    test_hidden_states = model.predict(X_test, lengths_test)
-    df_test['predicted_state'] = test_hidden_states
+    print("\nDecoding test set states (using filtered inference)...")
+    
+    # Use forward algorithm per patient instead of Viterbi
+    all_filtered_states = []
+    all_forecast_states = []
+    
+    idx = 0
+    for length in lengths_test:
+        X_patient = X_test[idx:idx + length]
+        
+        # Filtered inference: P(S_t | x_0:t)
+        filtered_probs = forward_algorithm(model, X_patient)
+        filtered_states = np.argmax(filtered_probs, axis=1)
+        
+        # Forecast: P(S_{t+1} | x_0:t) = P(S_t | x_0:t) @ T
+        forecast_probs = filtered_probs @ model.transmat_
+        forecast_states = np.argmax(forecast_probs, axis=1)
+        
+        all_filtered_states.extend(filtered_states)
+        all_forecast_states.extend(forecast_states)
+        
+        idx += length
+    
+    df_test['predicted_state'] = all_filtered_states
+    df_test['forecast_state_tplus1'] = all_forecast_states
     
     state_map = {0: 'Acute', 1: 'Recovery', 2: 'Weaning', 3: 'Liberation'}
     df_test['state_label'] = df_test['predicted_state'].map(state_map)
+
+    print("\nState distribution in test set:")
+    print(df_test['predicted_state'].value_counts(normalize=True))
     
-    # Add 1-hour forecast for each row (using transition matrix)
-    df_test['forecast_state_tplus1'] = df_test['predicted_state'].apply(
-        lambda s: np.argmax(model.transmat_[s])
-    )
+    print("\nMean raw values per state (PEEP, FiO2):")
+    for state in range(4):
+        mask = df_test['predicted_state'] == state
+        if mask.sum() > 0:
+            # Inverse transform to get raw values
+            raw = scaler.inverse_transform(df_test.loc[mask, FEATURES].values)
+            print(f"  {state_map[state]}: PEEP={raw[:, IDX_PEEP].mean():.1f}, FiO2={raw[:, IDX_FIO2].mean():.1f}")
+
     
+    print("\nLearned Covariances (diagonal, first 4 features):")
+    for i in range(4):
+        print(f"  State {i}: {model.covars_[i, :4]}")
+
     # Calculate 1-hour forecast accuracy on test set
-    # Compare forecast at t with actual state at t+1
+    # Compare forecast at t with FILTERED state at t+1
     print("\nCalculating 1-hour forecast accuracy on test set...")
     forecast_matches = []
     for person_id in test_ids:

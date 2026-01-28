@@ -12,8 +12,11 @@ import os
 #%%
 # I put Arif's data and the Agent A data in the clinical_data folder and put .csv files in the gitignore in case making the data public is an issue
 AgentA_data = pd.read_csv(os.path.join('..', 'clinical_data', 'Amsterdam_AgentA.csv'))
-RL_data = pd.read_csv(os.path.join('..', 'clinical_data', 'data_v1_max_72_h.csv'))
-
+# RL_data = pd.read_csv(os.path.join('..', 'clinical_data', 'data_v1_max_72_h.csv'))
+#parquet file
+RL_data = pd.read_parquet(os.path.join('..', 'clinical_data', 'data_v2_max_72_h.parquet'))
+RL_data.reset_index()
+RL_data_old = pd.read_csv(os.path.join('..', 'clinical_data', 'data_v1_max_72_h.csv'))
 
 # %%
 # list all columns in AgentA that have data
@@ -39,4 +42,9 @@ print('columns only in RL_data:', only_in_RL)
 #for every column in RL_data_columns, print the column and the dtype on one line
 for col in RL_data_columns:
     print(col, ',' , RL_data[col].dtype)
+# %%
+
+# find rows where 'Pressure Control' is a value in any column
+pressure_control_rows = RL_data.isin(['Pressure Control']).any(axis=1)
+print('there are {} rows with Pressure Control as a value'.format(pressure_control_rows.sum()))
 # %%

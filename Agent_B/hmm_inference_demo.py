@@ -45,37 +45,32 @@ def make_trend_features(df):
 
 def forward_algorithm(model, X):
     """
-    Compute true filtered posterior P(S_t | x_0:t) using the forward algorithm.
+    Compute true filtered posterior P(S_t | x_0:t)
+    
+    Returns:
+        filtered_probs: (T, n_components) array of P(S_t | x_0:t)
     """
     n_samples = len(X)
     n_components = model.n_components
     
     log_startprob = np.log(model.startprob_ + 1e-10)
     log_transmat = np.log(model.transmat_ + 1e-10)
-    
-    log_emit = np.zeros((n_samples, n_components))
-    
-    for k in range(n_components):
-        try:
-            if model.covariance_type == 'diag':
-                cov = np.diag(model.covars_[k])
-            else:
-                cov = model.covars_[k]
-            
-            mvn = multivariate_normal(mean=model.means_[k], cov=cov, allow_singular=True)
-            log_emit[:, k] = mvn.logpdf(X)
-        except Exception:
-            log_emit[:, k] = -100
-    
+        
+    # Precompute log emission probabilities
+    log_emit = model._compute_log_likelihood(X)
+
+    # Forward pass in log space
     log_alpha = np.zeros((n_samples, n_components))
+    
+    # Initialize: alpha_0 = pi * P(x_0 | S_0)
     log_alpha[0] = log_startprob + log_emit[0]
     
     for t in range(1, n_samples):
-        for j in range(n_components):
-            log_alpha[t, j] = log_emit[t, j] + np.logaddexp.reduce(
-                log_alpha[t-1] + log_transmat[:, j]
-            )
+        log_alpha[t] = log_emit[t] + np.logaddexp.reduce(
+            log_alpha[t-1, :, np.newaxis] + log_transmat, axis=0
+        )
     
+    # Normalize to get filtered probabilities
     log_normalizer = np.logaddexp.reduce(log_alpha, axis=1, keepdims=True)
     filtered_probs = np.exp(log_alpha - log_normalizer)
     
@@ -181,7 +176,7 @@ def find_subjects_with_state_changes(df, model, scaler, state_map, n_subjects=3)
 def main():
     model_path = 'hmm_model.pkl'
     scaler_path = 'scaler.pkl'
-    data_path = "clinical_data/data_v1_max_72_h.csv"
+    data_path = "clinical_data/data_v2_max_72_h.parquet"
     
     if not os.path.exists(model_path) or not os.path.exists(scaler_path):
         print("Error: Model or Scaler file not found. Please run hmm_prototype.py first.")
@@ -196,7 +191,8 @@ def main():
 
     # 2. Load and Preprocess Data
     print("Loading data...")
-    df = pd.read_csv(data_path)
+    df = pd.read_parquet(data_path)
+    df = df.reset_index()
     
     state_map = {0: 'Acute', 1: 'Recovery', 2: 'Weaning', 3: 'Liberation'}
 
@@ -270,3 +266,83 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+'''
+
+Debugging with Claude Opus 4.5 with copilot because everything was broken...
+
+
+================================================================================
+HMM MODELING DECISIONS & CHANGES - Session Summary
+================================================================================
+
+PROBLEMS DIAGNOSED:
+1. Corrupted data - PEEP values of 1637 (physiologically impossible)
+2. Covariance explosion - Trained covariances grew to 10^11, causing one state 
+   to absorb all observations (100% classified as "Recovery")
+3. Clinical centroids mismatched data - Initial means were too far from actual 
+   data distribution (e.g., Acute PEEP=14 vs data mean=7.1)
+
+--------------------------------------------------------------------------------
+FIXES APPLIED:
+--------------------------------------------------------------------------------
+
+| Issue                  | Solution                                            |
+|------------------------|-----------------------------------------------------|
+| Outliers/bad data      | Added physiological clipping in load_and_preprocess |
+| Covariance explosion   | Changed params='stc' → params='st' (freeze covars)  |
+| Centroid mismatch      | Adjusted clinical centroids to match data range     |
+| Viterbi uses future    | Replaced with forward_algorithm() for real-time     |
+
+--------------------------------------------------------------------------------
+FINAL MODEL CONFIGURATION:
+--------------------------------------------------------------------------------
+
+    model = GaussianHMM(
+        n_components=4,
+        covariance_type="diag",
+        init_params="",    # Don't auto-initialize anything
+        params='st',       # Only train: start probs + transitions
+        n_iter=100
+    )
+
+What's FROZEN (clinically defined):
+  - Means: 4 states based on PROMIZING Protocol cutoffs
+  - Covariances: Fixed at 1.0 (base features), 2.0 (trend features)
+
+What's LEARNED from data:
+  - Transition matrix: How patients move between states
+  - Start probabilities: Initial state distribution
+
+--------------------------------------------------------------------------------
+PHYSIOLOGICAL BOUNDS ADDED:
+--------------------------------------------------------------------------------
+
+| Feature       | Range         | Rationale              |
+|---------------|---------------|------------------------|
+| PEEP          | 0-25 cmH₂O    | Clinical max           |
+| Peak pressure | 5-60 cmH₂O    | Ventilator limits      |
+| SBP           | 40-250 mmHg   | Viable BP range        |
+| FiO₂          | 21-100%       | Room air to pure O₂    |
+
+--------------------------------------------------------------------------------
+INFERENCE CHANGE:
+--------------------------------------------------------------------------------
+
+| Before                      | After                                |
+|-----------------------------|--------------------------------------|
+| model.predict() (Viterbi)   | forward_algorithm() (filtered)       |
+| Uses all data incl. future  | Uses only past observations          |
+| Good for retrospective      | Valid for real-time bedside use      |
+
+--------------------------------------------------------------------------------
+KEY TAKEAWAY:
+--------------------------------------------------------------------------------
+This is now a SEMI-SUPERVISED HMM: clinical knowledge defines *what* the states 
+mean (fixed emissions), while the data teaches *how* patients transition between 
+them (learned dynamics).
+
+================================================================================
+'''

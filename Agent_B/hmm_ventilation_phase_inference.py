@@ -155,6 +155,7 @@ def load_and_prepare(filepath: str) -> pd.DataFrame:
     # Load data - handle both CSV and parquet
     if filepath.endswith('.parquet'):
         df = pd.read_parquet(filepath)
+        df = df.reset_index()
     else:
         df = pd.read_csv(filepath)
     
