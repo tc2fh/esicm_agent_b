@@ -14,7 +14,7 @@ import os
 AgentA_data = pd.read_csv(os.path.join('..', 'clinical_data', 'Amsterdam_AgentA.csv'))
 # RL_data = pd.read_csv(os.path.join('..', 'clinical_data', 'data_v1_max_72_h.csv'))
 #parquet file
-RL_data = pd.read_parquet(os.path.join('..', 'clinical_data', 'data_v2_max_72_h.parquet'))
+RL_data = pd.read_parquet(os.path.join('..', 'clinical_data', 'data_v3_max_72_h.parquet'))
 RL_data.reset_index()
 RL_data_old = pd.read_csv(os.path.join('..', 'clinical_data', 'data_v1_max_72_h.csv'))
 

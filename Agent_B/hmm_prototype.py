@@ -334,7 +334,7 @@ def visualize_patient_trajectory(model, patient_data, X_patient, state_map, file
 
 def main():
     print('main function started...')
-    data_path = "clinical_data/data_v2_max_72_h.parquet" # must be parquet file
+    data_path = "clinical_data/data_v3_max_72_h.parquet" # must be parquet file
     
     # 1. Load and Preprocess
     df = load_and_preprocess(data_path)
@@ -501,3 +501,33 @@ def main():
 if __name__ == "__main__":
     main()
 
+
+'''
+    model = GaussianHMM(
+        n_components=4,
+        covariance_type="diag",
+        init_params="",    # Don't auto-initialize anything
+        params='st',       # Only train: start probs + transitions
+        n_iter=100
+    )
+
+What's FROZEN (clinically defined):
+  - Means: 4 states based on PROMIZING Protocol cutoffs
+  - Covariances: Fixed at 1.0 (base features), 2.0 (trend features)
+
+What's LEARNED from data:
+  - Transition matrix: How patients move between states
+  - Start probabilities: Initial state distribution
+
+--------------------------------------------------------------------------------
+PHYSIOLOGICAL BOUNDS ADDED:
+--------------------------------------------------------------------------------
+
+| Feature       | Range         | Rationale              |
+|---------------|---------------|------------------------|
+| PEEP          | 0-25 cmH₂O    | Clinical max           |
+| Peak pressure | 5-60 cmH₂O    | Ventilator limits      |
+| SBP           | 40-250 mmHg   | Viable BP range        |
+| FiO₂          | 21-100%       | Room air to pure O₂    |
+
+'''

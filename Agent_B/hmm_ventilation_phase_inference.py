@@ -1,5 +1,6 @@
-#!/usr/bin/env python3
 """
+NOTE: Don't use this, it is incomplete, incorrect, exploratory at this point
+
 ==============================================================================
 HMM-based Ventilation Phase Inference & 1-Hour Forecasting Prototype
 ==============================================================================
